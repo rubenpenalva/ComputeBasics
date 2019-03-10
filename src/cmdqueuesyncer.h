@@ -30,5 +30,7 @@ private:
 
     std::vector<WorkWaiterPtr> m_workWaiters;
 
-    WorkWaiter* CreateWorkWaiter(uint64_t workId);
+    WorkWaiter* CreateWorkWaiter();
+    uint64_t CurrentWorkId();
+
 };
