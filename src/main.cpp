@@ -1,19 +1,26 @@
 #include <wrl.h>
 #include <dxgi1_6.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 
 #include <iostream>
 #include <cassert>
+#include <algorithm>
 
 #include "utils.h"
 #include "cmdqueuesyncer.h"
 
 #define ENABLE_D3D12_DEBUG_LAYER            ( 1 )
 #define ENABLE_D3D12_DEBUG_GPU_VALIDATION   ( 1 )
+#define ENABLE_PIX_CAPTURE                  ( 1 )
 
 #if ENABLE_D3D12_DEBUG_LAYER
 #include <Initguid.h>
 #include <dxgidebug.h>
+#endif
+
+#if ENABLE_PIX_CAPTURE
+#include <DXProgrammableCapture.h>
 #endif
 
 // Note actually comptr is not a smart ptr but a raii class using
@@ -25,6 +32,11 @@ using ID3D12CommandQueueComPtr              = Microsoft::WRL::ComPtr<ID3D12Comma
 using ID3D12ResourceComPtr                  = Microsoft::WRL::ComPtr<ID3D12Resource>;
 using ID3D12GraphicsCommandListComPtr       = Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>;
 using ID3D12CommandAllocatorComPtr          = Microsoft::WRL::ComPtr<ID3D12CommandAllocator>;
+using ID3D12DescriptorHeapComPtr            = Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>;
+using ID3D12PipelineStateComPtr             = Microsoft::WRL::ComPtr<ID3D12PipelineState>;
+using ID3DBlobComPtr                        = Microsoft::WRL::ComPtr<ID3DBlob>;
+using ID3D12RootSignatureComPtr             = Microsoft::WRL::ComPtr<ID3D12RootSignature>;
+using IDXGraphicsAnalysisComPtr             = Microsoft::WRL::ComPtr<IDXGraphicsAnalysis>;
 
 struct CommandQueue
 {
@@ -44,6 +56,64 @@ struct CommandList
     ID3D12GraphicsCommandListComPtr m_cmdList;
 };
 
+// Note this is fixed to D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+struct DescriptorHeap
+{
+    ID3D12DescriptorHeapComPtr  m_d3d12DescriptorHeap;
+    D3D12_GPU_DESCRIPTOR_HANDLE m_currentGpuHandle;
+    D3D12_CPU_DESCRIPTOR_HANDLE m_currentCpuHandle;
+
+    uint32_t                    m_descriptorHandleIncrementSize;
+};
+
+struct PipelineState
+{
+    ID3D12RootSignatureComPtr m_rootSignature;
+    ID3D12PipelineStateComPtr m_pso;
+};
+
+struct ConstantData
+{
+    float m_float;
+};
+
+const char* g_rootSignatureTarget = "rootsig_1_1";
+const char* g_rootSignatureName = "SimpleRootSig";
+const char* g_outputTag = "[ComputeBasics]";
+const char* g_computeShaderMain = "main";
+const char* g_computeShaderTarget = "cs_5_1";
+const UINT g_compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+
+#if ENABLE_PIX_CAPTURE
+class PixCapture
+{
+public:
+    PixCapture()
+    {
+        if (SUCCEEDED(DXGIGetDebugInterface1(0, IID_PPV_ARGS(&m_graphicsAnalysis))))
+        {
+            m_graphicsAnalysis->BeginCapture();
+        }
+        else
+        {
+            std::wcout << g_outputTag << "[PIX] A pix capture will not be triggered. Pix is not attached.\n";
+        }
+    }
+    ~PixCapture()
+    {
+        if (m_graphicsAnalysis)
+            m_graphicsAnalysis->EndCapture();
+    }
+    PixCapture(const PixCapture&) = delete;
+    PixCapture(PixCapture&&) = delete;
+    PixCapture& operator=(const PixCapture&) = delete;
+    PixCapture& operator=(PixCapture&&) = delete;
+    
+private:
+    IDXGraphicsAnalysisComPtr m_graphicsAnalysis;
+};
+#endif
+
 IDXGIAdapter1ComPtr CreateDXGIAdapter()
 {
     IDXGIFactory6ComPtr factory;
@@ -61,7 +131,7 @@ IDXGIAdapter1ComPtr CreateDXGIAdapter()
             Utils::AssertIfFailed(adapter->GetDesc1(&desc));
             if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
             {
-                std::wcout << "[Hardware init] Using adapter " << desc.Description << std::endl;
+                std::wcout << g_outputTag << "[Hardware init] Using adapter " << desc.Description << std::endl;
                 break;
             }
         }
@@ -287,26 +357,19 @@ D3D12_RESOURCE_BARRIER CreateTransition(ID3D12Resource* resource,
     return copyDestToReadDest;
 }
 
-void ExecuteSyncUploadDataToBuffer(ID3D12Device* device, 
-                                   ID3D12CommandQueue* copyCmdQueue, 
-                                   ID3D12GraphicsCommandList* copyCmdList, 
-                                   ID3D12CommandQueue* computeCmdQueue, 
-                                   ID3D12GraphicsCommandList* computeCmdList, 
-                                   ID3D12Resource* dst, const void* data, uint64_t sizeBytes)
+// TODO not quite happy with returning the temp here. Good enough for now.
+// Note returning the tmp so the object outlives the execution in the gpu
+BufferAllocation EnqueueUploadDataToBuffer(ID3D12Device* device,
+                                           ID3D12GraphicsCommandList* copyCmdList,
+                                           ID3D12Resource* dst, const void* data, uint64_t sizeBytes)
 {
     assert(device);
-    assert(copyCmdQueue);
     assert(copyCmdList);
-    assert(computeCmdQueue);
-    assert(computeCmdList);
     assert(dst);
     assert(data && sizeBytes);
-    
-    assert(copyCmdQueue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_COPY);
+
     assert(copyCmdList->GetType() == D3D12_COMMAND_LIST_TYPE_COPY);
-    assert(computeCmdQueue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_COMPUTE);
-    assert(computeCmdList->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE);
-    
+
     // Create temporal buffer in the upload heap
     BufferAllocation src = AllocateUploadBuffer(device, sizeBytes, L"Upload temp buffer");
     MemCpyGPUBuffer(src.m_resource.Get(), data, sizeBytes);
@@ -316,63 +379,421 @@ void ExecuteSyncUploadDataToBuffer(ID3D12Device* device,
     const UINT64 srcOffset = 0;
     const UINT64 numBytes = sizeBytes;
     copyCmdList->CopyBufferRegion(dst, 0, src.m_resource.Get(), 0, sizeBytes);
-    {
-        Utils::AssertIfFailed(copyCmdList->Close());
-        ID3D12CommandList* cmdLists[] = { copyCmdList };
-        copyCmdQueue->ExecuteCommandLists(1, cmdLists);
 
-        // Wait for the cmdlist to finish
-        CmdQueueSyncer cmdQueueSyncer(device, copyCmdQueue);
-        auto workId = cmdQueueSyncer.SignalWork();
-        cmdQueueSyncer.Wait(workId);
+    return src;
+}
+
+// Note batching up the transitions to improve performance
+void TransitionCopyDstResources(const std::vector<ID3D12Resource*>& dsts, 
+                                ID3D12GraphicsCommandList* computeCmdList)
+{
+    assert(!dsts.empty());
+    assert(computeCmdList);
+    assert(computeCmdList->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE);
+
+    std::vector<D3D12_RESOURCE_BARRIER> transitions;
+
+    for (auto& dst : dsts)
+    {
+        auto transition = CreateTransition(dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+        transitions.push_back(transition);
     }
 
-    auto transition = CreateTransition(dst, D3D12_RESOURCE_STATE_COMMON,
-                                       D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-    computeCmdList->ResourceBarrier(1, &transition);
-    {
-        Utils::AssertIfFailed(computeCmdList->Close());
-        ID3D12CommandList* cmdLists[] = { computeCmdList };
-        computeCmdQueue->ExecuteCommandLists(1, cmdLists);
+    computeCmdList->ResourceBarrier(static_cast<UINT>(transitions.size()), &transitions[0]);
+}
 
-        // Wait for the cmdlist to finish
-        CmdQueueSyncer cmdQueueSyncer(device, computeCmdQueue);
-        auto workId = cmdQueueSyncer.SignalWork();
-        cmdQueueSyncer.Wait(workId);
+void ExecuteCmdList(ID3D12Device* device, ID3D12CommandQueue* cmdQueue,
+                    ID3D12GraphicsCommandList* cmdList)
+{
+    assert(device);
+    assert(cmdQueue);
+    assert(cmdList);
+ 
+    Utils::AssertIfFailed(cmdList->Close());
+    ID3D12CommandList* cmdLists[] = { cmdList };
+    cmdQueue->ExecuteCommandLists(1, cmdLists);
+
+    // Wait for the cmdlist to finish
+    CmdQueueSyncer cmdQueueSyncer(device, cmdQueue);
+    auto workId = cmdQueueSyncer.SignalWork();
+    cmdQueueSyncer.Wait(workId);
+}
+
+// TODO move these to a class
+DescriptorHeap CreateDescriptorHeap(ID3D12Device* device, uint32_t descriptorsCount)
+{
+    assert(device);
+    assert(descriptorsCount > 0);
+
+    DescriptorHeap descriptorHeap;
+
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc;
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.NumDescriptors = descriptorsCount;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    heapDesc.NodeMask = 0;
+
+    Utils::AssertIfFailed(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&descriptorHeap.m_d3d12DescriptorHeap)));
+
+    descriptorHeap.m_currentGpuHandle = descriptorHeap.m_d3d12DescriptorHeap->GetGPUDescriptorHandleForHeapStart();
+    descriptorHeap.m_currentCpuHandle = descriptorHeap.m_d3d12DescriptorHeap->GetCPUDescriptorHandleForHeapStart();
+    
+    uint32_t incrementSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    descriptorHeap.m_descriptorHandleIncrementSize = incrementSize;
+
+    return descriptorHeap;
+}
+
+void AddDescriptor(DescriptorHeap& descriptorHeap)
+{
+    descriptorHeap.m_currentCpuHandle.ptr += descriptorHeap.m_descriptorHandleIncrementSize;
+    descriptorHeap.m_currentGpuHandle.ptr += descriptorHeap.m_descriptorHandleIncrementSize;
+}
+
+void CreateBufferDescriptor(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dst, 
+                            ID3D12Resource* resource, DXGI_FORMAT format, 
+                            uint32_t elementsCount)
+{
+    assert(device);
+    assert(resource);
+    assert(format != DXGI_FORMAT_UNKNOWN);
+    assert(elementsCount > 0);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc;
+    desc.Format = format;
+    desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
+    desc.Buffer.FirstElement = 0;
+    desc.Buffer.NumElements = elementsCount;
+    desc.Buffer.StructureByteStride = 0;
+    desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+
+    device->CreateShaderResourceView(resource, &desc, dst);
+}
+
+void CreateRWBufferDescriptor(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dst,
+                              ID3D12Resource* resource, DXGI_FORMAT format,
+                              uint32_t elementsCount)
+{
+    assert(device);
+    assert(resource);
+    assert(format != DXGI_FORMAT_UNKNOWN);
+    assert(elementsCount > 0);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC desc;
+    desc.Format = format;
+    desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    desc.Buffer.FirstElement = 0;
+    desc.Buffer.NumElements = elementsCount;
+    desc.Buffer.StructureByteStride = 0;
+    desc.Buffer.CounterOffsetInBytes = 0;
+    desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+
+    device->CreateUnorderedAccessView(resource, nullptr, &desc, dst);
+}
+
+void CreateStructuredBufferDescriptor(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dst, 
+                                      ID3D12Resource* resource, DXGI_FORMAT format,
+                                      uint32_t elementsCount, uint32_t structureByteStride)
+{
+    assert(device);
+    assert(resource);
+    assert(format != DXGI_FORMAT_UNKNOWN);
+    assert(elementsCount > 0);
+    assert(structureByteStride > 0);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc;
+    desc.Format = format;
+    desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    desc.Buffer.FirstElement = 0;
+    desc.Buffer.NumElements = elementsCount;
+    desc.Buffer.StructureByteStride = structureByteStride;
+    desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+
+    device->CreateShaderResourceView(resource, &desc, dst);
+}
+
+void CreateRWStructuredBufferDescriptor(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dst,
+                                        ID3D12Resource* resource, DXGI_FORMAT format,
+                                        uint32_t elementsCount, uint32_t structureByteStride)
+{
+    assert(device);
+    assert(resource);
+    assert(format != DXGI_FORMAT_UNKNOWN);
+    assert(elementsCount > 0);
+    assert(structureByteStride > 0);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC desc;
+    desc.Format = format;
+    desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    desc.Buffer.FirstElement = 0;
+    desc.Buffer.NumElements = elementsCount;
+    desc.Buffer.StructureByteStride = structureByteStride;
+    desc.Buffer.CounterOffsetInBytes = 0;
+    desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+
+    device->CreateUnorderedAccessView(resource, nullptr, &desc, dst);
+}
+
+void CreateByteBufferDescriptor(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dst,
+                                ID3D12Resource* resource, DXGI_FORMAT format,
+                                uint32_t elementsCount)
+{
+    assert(device);
+    assert(resource);
+    assert(format != DXGI_FORMAT_UNKNOWN);
+    assert(elementsCount > 0);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc;
+    desc.Format = format;
+    desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    desc.Buffer.FirstElement = 0;
+    desc.Buffer.NumElements = elementsCount;
+    desc.Buffer.StructureByteStride = 0;
+    desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+
+    device->CreateShaderResourceView(resource, &desc, dst);
+}
+
+void CreateRWByteBufferDescriptor(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dst,
+                                  ID3D12Resource* resource, DXGI_FORMAT format,
+                                  uint32_t elementsCount)
+{
+    assert(device);
+    assert(resource);
+    assert(format != DXGI_FORMAT_UNKNOWN);
+    assert(elementsCount > 0);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC desc;
+    desc.Format = format;
+    desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    desc.Buffer.FirstElement = 0;
+    desc.Buffer.NumElements = elementsCount;
+    desc.Buffer.StructureByteStride = 0;
+    desc.Buffer.CounterOffsetInBytes = 0;
+    desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+
+    device->CreateUnorderedAccessView(resource, nullptr, &desc, dst);
+}
+
+void CreateConstantBufferDescriptor(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dst,
+                                    D3D12_GPU_VIRTUAL_ADDRESS bufferLocation, uint32_t sizeBytes)
+{
+    assert(device);
+
+    D3D12_CONSTANT_BUFFER_VIEW_DESC desc;
+    desc.BufferLocation = bufferLocation;
+    desc.SizeInBytes = sizeBytes;
+
+    device->CreateConstantBufferView(&desc, dst);
+}
+
+ID3DBlobComPtr CompileBlob(const char* src, const char* target, const char* mainName, unsigned int flags,
+                           ID3DBlob* errors)
+{
+    ID3DBlobComPtr blob;
+
+    auto result = D3DCompile(src, strlen(src), nullptr, nullptr, nullptr, mainName, target, flags, 0, &blob, &errors);
+    if (FAILED(result))
+    {
+        assert(errors);
+
+        std::wcout << g_outputTag << " CompileBlob failed " << static_cast<const char*>(errors->GetBufferPointer());
+
+        return nullptr;
     }
+
+    return blob;
+}
+
+ID3D12RootSignatureComPtr CreateComputeRootSignature(ID3D12Device* device, const std::vector<char>& rootSignatureSrc, 
+                                                     const std::wstring& name)
+{
+    assert(device);
+    assert(rootSignatureSrc.size());
+
+    ID3DBlobComPtr errors;
+    auto rootSignatureBlob = CompileBlob(&rootSignatureSrc[0], g_rootSignatureTarget, g_rootSignatureName, 0, errors.Get());
+    if (!rootSignatureBlob)
+    {
+        std::wcout << g_outputTag << " [CreateComputeRootSignature] Failed to compile blob ";
+        if (errors)
+            std::cout << static_cast<const char*>(errors->GetBufferPointer()) << "\n";
+        return nullptr;
+    }
+
+    ID3D12RootSignatureComPtr rootSignature;
+    if (FAILED(device->CreateRootSignature(0, rootSignatureBlob->GetBufferPointer(), rootSignatureBlob->GetBufferSize(),
+                                           IID_PPV_ARGS(&rootSignature))))
+    {
+        std::wcout << g_outputTag << " [CreateComputeRootSignature] CreateRootSignature call failed\n";
+        return nullptr;
+    }
+
+    rootSignature->SetName(name.c_str());
+
+    return rootSignature;
+}
+
+ID3DBlobComPtr CreateComputeShader(ID3D12Device* device, const std::vector<char>& computeShaderSrc)
+{
+    assert(device);
+    assert(!computeShaderSrc.empty());
+
+    ID3DBlobComPtr errors;
+    auto computeShader = CompileBlob(&computeShaderSrc[0], g_computeShaderTarget, g_computeShaderMain, g_compileFlags, errors.Get());
+    if (!computeShader)
+    {
+        std::wcout << g_outputTag << " [CreateComputeRootSignature] failed to compile blob ";
+        if (errors)
+            std::wcout << static_cast<const char*>(errors->GetBufferPointer()) << "\n";
+        return nullptr;
+    }
+
+    return computeShader;
+}
+
+PipelineState CreatePipelineState(ID3D12Device* device, const std::wstring& shaderFileName, 
+                                  const std::wstring& rootSignatureName,
+                                  const std::wstring& pipelineStateName)
+{
+    assert(device);
+    assert(!shaderFileName.empty());
+    
+    const auto shaderSrc = Utils::ReadFullFile(shaderFileName);
+    if (shaderSrc.empty())
+    {
+        std::wcout << g_outputTag << " [CreatePipelineState] ReadFullFile " << shaderFileName.c_str() << " failed\n";
+        return {};
+    }
+
+    auto rootSignature = CreateComputeRootSignature(device, shaderSrc, rootSignatureName);
+    if (!rootSignature)
+        return {};
+
+    auto computeShader = CreateComputeShader(device, shaderSrc);
+    if (!computeShader)
+        return {};
+
+    ID3D12PipelineStateComPtr pipelineState;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc;
+    desc.pRootSignature = rootSignature.Get();
+    desc.CS             = { computeShader->GetBufferPointer(), computeShader->GetBufferSize() };
+    desc.NodeMask       = 0;
+    desc.CachedPSO      = {nullptr,0};
+    desc.Flags          = D3D12_PIPELINE_STATE_FLAG_NONE;
+
+    Utils::AssertIfFailed(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipelineState)));
+    pipelineState->SetName(pipelineStateName.c_str());
+
+    return { rootSignature, pipelineState };
 }
 
 int main(int argc, char** argv)
 {
+#if ENABLE_PIX_CAPTURE
+    PixCapture pixCapture;
+#endif
+
+    std::wcout << "\n";
+
     auto dxgiAdapter = CreateDXGIAdapter();
     auto d3d12DevicePtr = CreateD3D12Device(dxgiAdapter);
     auto d3d12Device = d3d12DevicePtr.Get();
 
-    auto computeCmdQueue = CreateComputeCmdQueue(d3d12Device);
-    auto computeCmdList = CreateComputeCommandList(d3d12Device, L"Compute");
-    auto copyCmdQueue = CreateCopyCmdQueue(d3d12Device);
-    auto copyCmdList = CreateCopyCommandList(d3d12Device, L"Copy");
+    // Create a compute shader
+    const std::wstring computeShaderFileName = L"./data/shaders/simple.hlsl";
+    PipelineState pipelineState = CreatePipelineState(d3d12Device, computeShaderFileName, L"Simple", L"Simple");
+    if (!pipelineState.m_rootSignature || !pipelineState.m_pso)
+        return -1;
 
     // Allocates buffers
-    const size_t dataElementsCount = 4;
-    const float data[dataElementsCount] = { -1.0f, -2.0f, -3.0f, -4.0f };
+    auto constantDataBuffer = AllocateReadOnlyBuffer(d3d12Device, sizeof(ConstantData), true, L"ConstantData");
+    const size_t threadsPerGroup = 64;
+    const size_t threadGroupsCount = 16;
+    const size_t dataElementsCount = threadsPerGroup * threadGroupsCount;
     const uint64_t dataSizeBytes = dataElementsCount * sizeof(float);
     auto inputBuffer = AllocateReadOnlyBuffer(d3d12Device, dataSizeBytes, true, L"Input");
-    ExecuteSyncUploadDataToBuffer(d3d12Device, 
-                                  copyCmdQueue.m_cmdQueue.Get(), copyCmdList.m_cmdList.Get(), 
-                                  computeCmdQueue.m_cmdQueue.Get(), computeCmdList.m_cmdList.Get(), 
-                                  inputBuffer.m_resource.Get(),
-                                  data, dataSizeBytes);
+    const uint64_t dataPerGroupSizeBytes = threadGroupsCount * sizeof(float);
+    auto inputPerGroupBuffer = AllocateReadOnlyBuffer(d3d12Device, dataPerGroupSizeBytes, true, L"Input Per Thread Group");
     auto outputBuffer = AllocateRWBuffer(d3d12Device, dataSizeBytes, false, L"Output");
     auto readbackBuffer = AllocateReadbackBuffer(d3d12Device, dataSizeBytes, L"ReadBack");
     auto timeStampBuffer = AllocateReadbackBuffer(d3d12Device, dataSizeBytes, L"TimeStamp");
 
+    // Upload data to gpu memory
+    auto computeCmdQueue = CreateComputeCmdQueue(d3d12Device);
+    auto computeCmdList = CreateComputeCommandList(d3d12Device, L"Compute");
+    auto copyCmdQueue = CreateCopyCmdQueue(d3d12Device);
+    auto copyCmdList = CreateCopyCommandList(d3d12Device, L"Copy");
+    {
+        ConstantData constantData{ -1.0f };
+        auto constantDataTmp = EnqueueUploadDataToBuffer(d3d12Device, copyCmdList.m_cmdList.Get(), 
+                                                          constantDataBuffer.m_resource.Get(), 
+                                                          &constantData, sizeof(ConstantData));
+
+        std::vector<float> inputData(dataElementsCount);
+        std::generate(inputData.begin(), inputData.end(), [v = 0.0f]() mutable
+        {
+            return v++;
+        });
+        auto inputBufferTmp = EnqueueUploadDataToBuffer(d3d12Device, copyCmdList.m_cmdList.Get(), 
+                                                        inputBuffer.m_resource.Get(), 
+                                                        &inputData[0], dataSizeBytes);
+
+        std::vector<float> inputDataPerThreadGroup(threadGroupsCount);
+        std::generate(inputDataPerThreadGroup.begin(), inputDataPerThreadGroup.end(), [v = 0.0f]() mutable
+        {
+            return v++;
+        });
+        auto inputPerGroupBuffertmp = EnqueueUploadDataToBuffer(d3d12Device, copyCmdList.m_cmdList.Get(), 
+                                                                inputPerGroupBuffer.m_resource.Get(),
+                                                                &inputDataPerThreadGroup[0], dataPerGroupSizeBytes);
+
+        ExecuteCmdList(d3d12Device, copyCmdQueue.m_cmdQueue.Get(), copyCmdList.m_cmdList.Get());
+
+        std::vector<ID3D12Resource*> dsts{ constantDataBuffer.m_resource.Get(),
+                                            inputBuffer.m_resource.Get(),
+                                            inputPerGroupBuffer.m_resource.Get() };
+        TransitionCopyDstResources(dsts, computeCmdList.m_cmdList.Get());
+    }
+
     // Creates descriptors
-    // Create a compute shader
+    const uint32_t descriptorsCount = 2;
+    DescriptorHeap descriptorHeap = CreateDescriptorHeap(d3d12Device, descriptorsCount);
+    auto descriptorTable = descriptorHeap.m_currentGpuHandle;
+    {
+        //const DXGI_FORMAT inputBufferFormat = DXGI_FORMAT_R32_FLOAT;
+        //CreateBufferDescriptor(d3d12Device, descriptorHeap.m_currentCpuHandle, inputBuffer.m_resource.Get(),
+        //                       inputBufferFormat, dataElementsCount);
+        //AddDescriptor(descriptorHeap);
+        const DXGI_FORMAT outputBufferFormat = DXGI_FORMAT_R32_FLOAT;
+        CreateRWBufferDescriptor(d3d12Device, descriptorHeap.m_currentCpuHandle, outputBuffer.m_resource.Get(),
+                                 outputBufferFormat, dataElementsCount);
+        AddDescriptor(descriptorHeap);
+    }
+
     // Setup state
-    // Dispatch cs
+    auto& d3d12Cmdlist = computeCmdList.m_cmdList;
+    ID3D12DescriptorHeap* d3d12DescriptorHeaps[] = { descriptorHeap.m_d3d12DescriptorHeap.Get() };
+    d3d12Cmdlist->SetDescriptorHeaps(1, d3d12DescriptorHeaps);
+    d3d12Cmdlist->SetComputeRootSignature(pipelineState.m_rootSignature.Get());
+    //d3d12Cmdlist->SetComputeRootConstantBufferView(0, constantDataBuffer.m_resource->GetGPUVirtualAddress());
+    //d3d12Cmdlist->SetComputeRootDescriptorTable(1, descriptorTable);
+    d3d12Cmdlist->SetComputeRootDescriptorTable(0, descriptorTable);
+    //d3d12Cmdlist->SetComputeRootShaderResourceView(2, inputPerGroupBuffer.m_resource->GetGPUVirtualAddress());
+    d3d12Cmdlist->SetPipelineState(pipelineState.m_pso.Get());
+
+    // Dispatch and execute
+    d3d12Cmdlist->Dispatch(threadGroupsCount, 1, 1);
+    ExecuteCmdList(d3d12Device, computeCmdQueue.m_cmdQueue.Get(), d3d12Cmdlist.Get());
+
     // Read readback buffer
+    
     // Read timestamp buffer
+
     // Output readback and timestamp buffer
 
 #if ENABLE_D3D12_DEBUG_LAYER
