@@ -389,12 +389,22 @@ BufferAllocation EnqueueUploadDataToBuffer(ID3D12Device* device,
     MemCpyGPUBuffer(src.m_resource.Get(), data, sizeBytes);
 
     // Copy from upload heap to final buffer
-    const UINT64 dstOffset = 0;
-    const UINT64 srcOffset = 0;
-    const UINT64 numBytes = sizeBytes;
-    copyCmdList->CopyBufferRegion(dst, 0, src.m_resource.Get(), 0, sizeBytes);
+    copyCmdList->CopyResource(dst, src.m_resource.Get());
 
     return src;
+}
+
+void EnqueueCopyBuffer(ID3D12Device* device,
+                       ID3D12GraphicsCommandList* copyCmdList, 
+                       ID3D12Resource* dst, ID3D12Resource* src)
+{
+    assert(device);
+    assert(copyCmdList);
+    assert(copyCmdList->GetType() == D3D12_COMMAND_LIST_TYPE_COPY);
+    assert(dst);
+    assert(src);
+
+    copyCmdList->CopyResource(dst, src);
 }
 
 // Note batching up the transitions to improve performance
@@ -740,30 +750,44 @@ void EnqueueResolveTimestampQueries(ID3D12GraphicsCommandList* cmdList, ID3D12Qu
     cmdList->ResolveQueryData(queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, 0, timeStampsCount, readbackBuffer, 0);
 }
 
-std::vector<double> ReadbackTimestamps(ID3D12Resource* readbackBuffer, uint32_t timestampsCount, 
-                                      uint64_t cmdQueueTimestampFrequency)
+template<class T, class F>
+std::vector<T> ReadbackBuffer(ID3D12Resource* readbackBuffer, uint64_t sizeBytes, F&& ProcessData)
 {
     assert(readbackBuffer);
-    assert(timestampsCount > 0);
-
     D3D12_RANGE readRange = {};
     readRange.Begin = 0;
-    readRange.End = timestampsCount * sizeof(uint64_t);
+    readRange.End = sizeBytes;
 
     void* data = nullptr;
     Utils::AssertIfFailed(readbackBuffer->Map(0, &readRange, &data));
 
-    std::vector<double> timestamps(timestampsCount);
-    // Note timestamps data are ticks and cmd queue timestamp frequency is ticks/sec
-    const uint64_t* timestampsTicks = reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(data));
-    for (uint32_t i = 0; i < timestampsCount; ++i)
-    {
-        timestamps[i] = timestampsTicks[i] / static_cast<double>(cmdQueueTimestampFrequency);
-    }
+    std::vector<T> buffer = ProcessData(data);
+
     D3D12_RANGE emptyRange = {};
     readbackBuffer->Unmap(0, &emptyRange);
 
-    return timestamps;
+    return buffer;
+}
+
+std::vector<double> ReadbackTimestamps(ID3D12Resource* readbackBuffer, uint32_t timestampsCount, 
+                                       uint64_t cmdQueueTimestampFrequency)
+{
+    assert(readbackBuffer);
+    assert(timestampsCount > 0);
+
+    auto buffer = ReadbackBuffer<double>(readbackBuffer, timestampsCount * sizeof(uint64_t), 
+                                         [&](void* data)
+    {
+        std::vector<double> timestamps(timestampsCount);
+        // Note timestamps data are ticks and cmd queue timestamp frequency is ticks/sec
+        const uint64_t* timestampsTicks = reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(data));
+        for (uint32_t i = 0; i < timestampsCount; ++i)
+        {
+            timestamps[i] = timestampsTicks[i] / static_cast<double>(cmdQueueTimestampFrequency);
+        }
+        return timestamps;
+    });
+    return buffer;
 }
 
 int main(int argc, char** argv)
@@ -820,7 +844,7 @@ int main(int argc, char** argv)
                                                         &inputData[0], dataSizeBytes);
 
         std::vector<float> inputDataPerThreadGroup(threadGroupsCount);
-        std::generate(inputDataPerThreadGroup.begin(), inputDataPerThreadGroup.end(), [v = 0.0f]() mutable
+        std::generate(inputDataPerThreadGroup.begin(), inputDataPerThreadGroup.end(), [v = 1.0f]() mutable
         {
             return v++;
         });
@@ -876,16 +900,42 @@ int main(int argc, char** argv)
     EnqueueTimestampQuery(d3d12Cmdlist.Get(), timestampQueryHeap.Get(), 1);
     EnqueueResolveTimestampQueries(d3d12Cmdlist.Get(), timestampQueryHeap.Get(), timestampsCount, timeStampBuffer.m_resource.Get());
 
+    D3D12_RESOURCE_BARRIER transition = CreateTransition(outputBuffer.m_resource.Get(), 
+                                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                         D3D12_RESOURCE_STATE_COMMON);
+    d3d12Cmdlist->ResourceBarrier(1, &transition);
+
     ExecuteCmdList(d3d12Device, computeCmdQueue.m_cmdQueue.Get(), d3d12Cmdlist.Get());
 
     // Read readback buffer
+    {
+        // Copy from default buffer to readback buffer
+        copyCmdList.m_cmdList->Reset(copyCmdList.m_allocator.Get(), nullptr);
+        EnqueueCopyBuffer(d3d12Device, copyCmdList.m_cmdList.Get(), 
+                          readbackBuffer.m_resource.Get(), outputBuffer.m_resource.Get());
+        ExecuteCmdList(d3d12Device, copyCmdQueue.m_cmdQueue.Get(), copyCmdList.m_cmdList.Get());
+
+        // Read from readback buffer
+        std::vector<float> cpuOutputBuffer = ReadbackBuffer<float>(readbackBuffer.m_resource.Get(), dataSizeBytes, 
+                                                                   [&](void* data)
+        {
+            std::vector<float> outputBuffer(dataElementsCount);
+            memcpy(&outputBuffer[0], data, dataSizeBytes);
+            return outputBuffer;
+        });
+
+        std::wcout << g_outputTag << "[Output Buffer] ";
+        for (size_t i = 0; i < cpuOutputBuffer.size(); ++i)
+        {
+            std::wcout << " " << i << ":"<< cpuOutputBuffer[i] << " ";
+        }
+        std::cout << "\n";
+    }
     
     // Read timestamp buffer
     auto timestamps = ReadbackTimestamps(timeStampBuffer.m_resource.Get(), timestampsCount, computeCmdQueue.m_timestampFrequency);
     const double deltaMicroSecs = (timestamps[1] - timestamps[0]) * 1000000.0;
     std::wcout << g_outputTag << "[Performance] GPU execution time " << deltaMicroSecs << "us\n";
-    
-    // Output readback and timestamp buffer
 
 #if ENABLE_D3D12_DEBUG_LAYER
     ReportLiveObjects();

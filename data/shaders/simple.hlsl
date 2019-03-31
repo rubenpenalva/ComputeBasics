@@ -20,5 +20,5 @@ void main(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex,
 {
     const uint threadGroupId = groupId.x;
     const uint threadId = dispatchThreadId.x;
-    g_outputData[threadId] = g_inputData[threadId] * g_constantData.m_float + g_inputData1[threadGroupId];
+    g_outputData[threadId] = g_inputData[threadId] * g_constantData.m_float * g_inputData1[threadGroupId];
 }
