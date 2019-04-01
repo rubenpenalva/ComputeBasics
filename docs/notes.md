@@ -7,7 +7,9 @@ D3D12 ERROR: ID3D12Device::CreateComputePipelineState: Root Signature doesn't ma
 According to msdn [Using descriptors directly in the root signature](https://docs.microsoft.com/en-us/windows/desktop/direct3d12/using-descriptors-directly-in-the-root-signature): "The only types of descriptors supported in the root signature are CBVs and SRV/UAVs of buffer resources, where the SRV/UAV format contains only 32 bit FLOAT/UINT/SINT components. There is no format conversion."
 Switching to an StructuredBuffer<float> fixes the issue. **Why?**
 
-## TODO
+## WIP
 Add texture support
+
+## TODO
 Readback heap vs default&copy&readback
     Test writing and then reading a buffer from a readback heap vs writing to a default buffer, copying it to a readback heap and then reading it.
