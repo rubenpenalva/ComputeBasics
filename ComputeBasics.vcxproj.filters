@@ -16,6 +16,12 @@
     <Filter Include="Shaders">
       <UniqueIdentifier>{33d357e7-1fd1-4838-b718-68deca80820e}</UniqueIdentifier>
     </Filter>
+    <Filter Include="ThirdParty">
+      <UniqueIdentifier>{0e4b1534-ea71-4b2a-abfc-47c3799c6feb}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ThirdParty\TinyExr">
+      <UniqueIdentifier>{93333ae0-66d0-49b1-93e5-9be03c8aa56d}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp">
@@ -37,6 +43,9 @@
     </ClInclude>
     <ClInclude Include="src\utils.h">
       <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="thirdparty\tinyexr\tinyexr.h">
+      <Filter>ThirdParty\TinyExr</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

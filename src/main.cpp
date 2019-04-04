@@ -13,6 +13,7 @@
 #define ENABLE_D3D12_DEBUG_LAYER            ( 1 )
 #define ENABLE_D3D12_DEBUG_GPU_VALIDATION   ( 1 )
 #define ENABLE_PIX_CAPTURE                  ( 1 )
+#define ENABLE_RGA_COMPATIBILITY            ( 1 )
 
 #if ENABLE_D3D12_DEBUG_LAYER
 #include <Initguid.h>
@@ -88,7 +89,11 @@ const char* g_rootSignatureTarget = "rootsig_1_1";
 const char* g_rootSignatureName = "SimpleRootSig";
 const char* g_outputTag = "[ComputeBasics]";
 const char* g_computeShaderMain = "main";
+#ifdef ENABLE_RGA_COMPATIBILITY
+const char* g_computeShaderTarget = "cs_5_0";
+#else
 const char* g_computeShaderTarget = "cs_5_1";
+#endif
 const UINT g_compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 const D3D12_RESOURCE_STATES g_cbState       = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
 const D3D12_RESOURCE_STATES g_bufferState   = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;

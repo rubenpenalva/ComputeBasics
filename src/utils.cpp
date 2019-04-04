@@ -8,6 +8,24 @@
 #undef max
 #endif
 
+#define TINYEXR_IMPLEMENTATION
+#include "tinyexr/tinyexr.h"
+
+namespace
+{
+std::string ConvertFromUTF16ToUTF8(const std::wstring& str)
+{
+    auto outStrLength = WideCharToMultiByte(CP_UTF8, 0, str.c_str(), -1, 0, 0, 0, 0);
+    assert(outStrLength);
+    std::string outStr(outStrLength, 0);
+    auto result = WideCharToMultiByte(CP_UTF8, 0, str.c_str(), -1, &outStr[0], static_cast<int>(outStr.size()), 0, 0);
+    result;
+    assert(result == outStr.size());
+
+    return outStr;
+}
+}
+
 void Utils::AssertIfFailed(HRESULT hr)
 {
 #if NDEBUG
@@ -52,4 +70,47 @@ std::vector<char> Utils::ReadFullFile(const std::wstring& fileName, bool readAsB
     if (!readAsBinary)
         buffer[fileSize] = '\0';
     return buffer;
+}
+
+Utils::TexRawDataPtr Utils::ReadTexRawDataFromFile(const std::wstring& fileName)
+{
+    std::vector<char> inputData = ReadFullFile(fileName, true);
+    if (inputData.empty())
+        return nullptr;
+
+    float* outData = nullptr;
+    int outWidth = 0;
+    int outHeight = 0;
+    const char* outError = nullptr;
+
+    int ret = LoadEXRFromMemory(&outData, &outWidth, &outHeight, 
+                                reinterpret_cast<unsigned char*>(&inputData[0]), inputData.size(), &outError);
+    if (ret != TINYEXR_SUCCESS)
+    {
+        // TODO do something with the error
+        FreeEXRErrorMessage(outError);
+        return nullptr;
+    }
+
+    return std::make_unique<TexRawData>(outData, outWidth, outHeight);
+}
+
+bool Utils::WriteTexRawDataToFile(const std::wstring& fileName, const TexRawData* texRawData)
+{
+    assert(texRawData);
+    auto fileNameStr = ConvertFromUTF16ToUTF8(fileName);
+
+    const char* outError = nullptr;
+    const int components = 4; //fixed to rgba when using LoadEXRFromMemory
+    const bool saveAsFloat16 = true;
+    int ret = SaveEXR(texRawData->m_data, texRawData->m_width, texRawData->m_height, components, 
+                      saveAsFloat16, fileNameStr.c_str(), &outError);
+    if (ret != TINYEXR_SUCCESS)
+    {
+        // TODO do something with the error
+        FreeEXRErrorMessage(outError);
+        return false;
+    }
+
+    return true;
 }
