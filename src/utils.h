@@ -4,6 +4,7 @@
 #include <wtypes.h>
 #include <vector>
 #include <memory>
+#include <d3d12.h>
 
 namespace Utils
 {
@@ -40,5 +41,9 @@ std::vector<char> ReadFullFile(const std::wstring& fileName, bool readAsBinary =
 TexRawDataPtr ReadTexRawDataFromFile(const std::wstring& fileName);
 
 bool WriteTexRawDataToFile(const std::wstring& fileName, const TexRawData* texRawData);
+
+bool CheckFormatSupport(ID3D12Device* device, DXGI_FORMAT format, D3D12_FORMAT_SUPPORT1 inputFormatSupport1);
+
+bool CheckFormatSupport(ID3D12Device* device, DXGI_FORMAT format, D3D12_FORMAT_SUPPORT2 inputFormatSupport);
 
 }

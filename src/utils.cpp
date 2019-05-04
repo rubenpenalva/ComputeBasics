@@ -114,3 +114,33 @@ bool Utils::WriteTexRawDataToFile(const std::wstring& fileName, const TexRawData
 
     return true;
 }
+
+bool Utils::CheckFormatSupport(ID3D12Device* device, DXGI_FORMAT format, D3D12_FORMAT_SUPPORT1 inputFormatSupport1)
+{
+    assert(device);
+
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT formatSupport = { format, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE };
+    Utils::AssertIfFailed(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &formatSupport, sizeof(formatSupport)));
+
+    return formatSupport.Support1 & inputFormatSupport1;
+}
+
+// https://docs.microsoft.com/en-us/windows/desktop/direct3d12/typed-unordered-access-view-loads
+bool Utils::CheckFormatSupport(ID3D12Device* device, DXGI_FORMAT format, D3D12_FORMAT_SUPPORT2 inputFormatSupport)
+{
+    assert(device);
+    // TODO add check support for other features
+    assert(inputFormatSupport == D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE || inputFormatSupport == D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD);
+    if (inputFormatSupport != D3D12_FORMAT_SUPPORT2_NONE)
+    {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS featureData;
+        Utils::AssertIfFailed(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &featureData, sizeof(featureData)));
+        if (!featureData.TypedUAVLoadAdditionalFormats)
+            return false;
+    }
+
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT formatSupport = { format, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE };
+    Utils::AssertIfFailed(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &formatSupport, sizeof(formatSupport)));
+
+    return formatSupport.Support2 & inputFormatSupport;
+}

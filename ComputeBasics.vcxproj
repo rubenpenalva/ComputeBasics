@@ -97,12 +97,16 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\cmdqueuesyncer.cpp" />
+    <ClCompile Include="src\descriptors.cpp" />
+    <ClCompile Include="src\gpumemory.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\utils.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\cmdqueuesyncer.h" />
-    <ClInclude Include="src\d3d12fwd.h" />
+    <ClInclude Include="src\common.h" />
+    <ClInclude Include="src\descriptors.h" />
+    <ClInclude Include="src\gpumemory.h" />
     <ClInclude Include="src\utils.h" />
     <ClInclude Include="thirdparty\tinyexr\tinyexr.h" />
   </ItemGroup>

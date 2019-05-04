@@ -1,10 +1,6 @@
 #include "CmdQueueSyncer.h"
 
-#include <wrl.h>
-#include <d3d12.h>
-
 #include "utils.h"
-#include <cassert>
 
 class CmdQueueSyncer::WorkWaiter
 {

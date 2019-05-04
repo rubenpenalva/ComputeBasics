@@ -1,6 +1,6 @@
 #pragma once
 
-#include "d3d12fwd.h"
+#include "common.h"
 
 #include <memory>
 #include <vector>

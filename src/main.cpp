@@ -1,44 +1,21 @@
-#include <wrl.h>
-#include <dxgi1_6.h>
-#include <d3d12.h>
-#include <d3dcompiler.h>
+#include "common.h"
 
+#include <d3dcompiler.h>
 #include <iostream>
-#include <cassert>
 #include <algorithm>
 
 #include "utils.h"
 #include "cmdqueuesyncer.h"
-
-#define ENABLE_D3D12_DEBUG_LAYER            ( 1 )
-#define ENABLE_D3D12_DEBUG_GPU_VALIDATION   ( 1 )
-#define ENABLE_PIX_CAPTURE                  ( 1 )
-#define ENABLE_RGA_COMPATIBILITY            ( 1 )
+#include "gpumemory.h"
+#include "descriptors.h"
 
 #if ENABLE_D3D12_DEBUG_LAYER
 #include <Initguid.h>
 #include <dxgidebug.h>
 #endif
 
-#if ENABLE_PIX_CAPTURE
-#include <DXProgrammableCapture.h>
-#endif
-
-// Note actually comptr is not a smart ptr but a raii class using
-// IUnknown AddRef and Release functions
-using IDXGIAdapter1ComPtr                   = Microsoft::WRL::ComPtr<IDXGIAdapter1>;
-using IDXGIFactory6ComPtr                   = Microsoft::WRL::ComPtr<IDXGIFactory6>;
-using ID3D12DeviceComPtr                    = Microsoft::WRL::ComPtr<ID3D12Device>;
-using ID3D12CommandQueueComPtr              = Microsoft::WRL::ComPtr<ID3D12CommandQueue>;
-using ID3D12ResourceComPtr                  = Microsoft::WRL::ComPtr<ID3D12Resource>;
-using ID3D12GraphicsCommandListComPtr       = Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>;
-using ID3D12CommandAllocatorComPtr          = Microsoft::WRL::ComPtr<ID3D12CommandAllocator>;
-using ID3D12DescriptorHeapComPtr            = Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>;
-using ID3D12PipelineStateComPtr             = Microsoft::WRL::ComPtr<ID3D12PipelineState>;
-using ID3DBlobComPtr                        = Microsoft::WRL::ComPtr<ID3DBlob>;
-using ID3D12RootSignatureComPtr             = Microsoft::WRL::ComPtr<ID3D12RootSignature>;
-using IDXGraphicsAnalysisComPtr             = Microsoft::WRL::ComPtr<IDXGraphicsAnalysis>;
-using ID3D12QueryHeapComPtr                 = Microsoft::WRL::ComPtr<ID3D12QueryHeap>;
+namespace ComputeBasics
+{
 
 struct CommandQueue
 {
@@ -46,26 +23,10 @@ struct CommandQueue
     uint64_t                    m_timestampFrequency;
 };
 
-struct BufferAllocation
-{
-    ID3D12ResourceComPtr    m_resource;
-    uint64_t                m_alignedSize;
-};
-
 struct CommandList
 {
     ID3D12CommandAllocatorComPtr    m_allocator;
     ID3D12GraphicsCommandListComPtr m_cmdList;
-};
-
-// Note this is fixed to D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
-struct DescriptorHeap
-{
-    ID3D12DescriptorHeapComPtr  m_d3d12DescriptorHeap;
-    D3D12_GPU_DESCRIPTOR_HANDLE m_currentGpuHandle;
-    D3D12_CPU_DESCRIPTOR_HANDLE m_currentCpuHandle;
-
-    uint32_t                    m_descriptorHandleIncrementSize;
 };
 
 struct PipelineState
@@ -97,8 +58,6 @@ const char* g_computeShaderTarget = "cs_5_1";
 const UINT g_compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 const D3D12_RESOURCE_STATES g_cbState       = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
 const D3D12_RESOURCE_STATES g_bufferState   = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-const D3D12_RESOURCE_STATES g_uaState       = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-const D3D12_RESOURCE_STATES g_cpyDstState   = D3D12_RESOURCE_STATE_COMMON;
 
 #if ENABLE_PIX_CAPTURE
 class PixCapture
@@ -187,6 +146,7 @@ void ReportLiveObjects()
 }
 #endif
 
+// TODO move the command queues and lists codes to its own file
 CommandQueue CreateCommandQueue(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, 
                                 bool disableTimeout, const std::wstring& name)
 {
@@ -251,114 +211,6 @@ CommandList CreateComputeCommandList(ID3D12Device* device, const std::wstring& n
     return CreateCommandList(device, type, name);
 }
 
-ID3D12ResourceComPtr CreateCommitedResource(ID3D12Device* device, D3D12_HEAP_TYPE heapType,
-                                            const D3D12_RESOURCE_DESC& resourceDesc, 
-                                            D3D12_RESOURCE_STATES initialState,
-                                            const std::wstring& name)
-{
-    assert(device);
-
-    D3D12_HEAP_PROPERTIES heapProperties;
-    heapProperties.Type                   = heapType;
-    heapProperties.CPUPageProperty        = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-    heapProperties.MemoryPoolPreference   = D3D12_MEMORY_POOL_UNKNOWN;
-    heapProperties.CreationNodeMask       = 1;
-    heapProperties.VisibleNodeMask        = 1;
-
-    D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_NONE;
-
-    ID3D12ResourceComPtr resource;
-    Utils::AssertIfFailed(device->CreateCommittedResource(&heapProperties, heapFlags, &resourceDesc, initialState,
-                                                           nullptr, IID_PPV_ARGS(&resource)));
-    
-    resource->SetName(name.c_str());
-
-    return resource;
-}
-
-D3D12_RESOURCE_DESC CreateBufferDesc(uint64_t sizeBytes, bool isUA)
-{
-    Utils::IsAlignedToPowerof2(sizeBytes, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
-
-    // https://msdn.microsoft.com/en-us/library/windows/desktop/dn903813(v=vs.85).aspx
-    // Alignment must be 64KB (D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) or 0, which is effectively 64KB.
-    D3D12_RESOURCE_DESC resourceDesc;
-    resourceDesc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
-    resourceDesc.Alignment          = 0;
-    resourceDesc.Width              = sizeBytes;
-    resourceDesc.Height             = 1;
-    resourceDesc.DepthOrArraySize   = 1;
-    resourceDesc.MipLevels          = 1;
-    resourceDesc.Format             = DXGI_FORMAT_UNKNOWN;
-    resourceDesc.SampleDesc         = { 1, 0 };
-    resourceDesc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    resourceDesc.Flags              = isUA? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : 
-                                            D3D12_RESOURCE_FLAG_NONE;
-
-    return resourceDesc;
-}
-
-BufferAllocation CreateBuffer(ID3D12Device* device, uint64_t sizeBytes, D3D12_HEAP_TYPE heapType,
-                              D3D12_RESOURCE_STATES initialState, bool isUA, const std::wstring& name)
-{
-    size_t bufferAligment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
-    const auto alignedSize = Utils::AlignToPowerof2(sizeBytes, bufferAligment);
-    D3D12_RESOURCE_DESC resourceDesc = CreateBufferDesc(alignedSize, isUA);
-
-    ID3D12ResourceComPtr resource = CreateCommitedResource(device, heapType, resourceDesc, initialState, name);
-    return BufferAllocation{ resource, alignedSize };
-}
-
-BufferAllocation AllocateUploadBuffer(ID3D12Device* device, uint64_t sizeBytes, const std::wstring& name)
-{
-    const auto heapType = D3D12_HEAP_TYPE_UPLOAD;
-    const auto initialState = D3D12_RESOURCE_STATE_GENERIC_READ;
-    const auto isUA = false;
-    return CreateBuffer(device, sizeBytes, heapType, initialState, isUA, name);
-}
-
-BufferAllocation AllocateReadOnlyBuffer(ID3D12Device* device, uint64_t sizeBytes, 
-                                        D3D12_RESOURCE_STATES initialState,
-                                        const std::wstring& name)
-{
-    const auto heapType = D3D12_HEAP_TYPE_DEFAULT;
-    const bool isUA = false;
-    return CreateBuffer(device, sizeBytes, heapType, initialState, isUA, name);
-}
-
-BufferAllocation AllocateRWBuffer(ID3D12Device* device, uint64_t sizeBytes, 
-                                  D3D12_RESOURCE_STATES initialState,
-                                  const std::wstring& name)
-{
-    const auto heapType = D3D12_HEAP_TYPE_DEFAULT;
-    const bool isUA = true;
-    return CreateBuffer(device, sizeBytes, heapType, initialState, isUA, name);
-}
-
-BufferAllocation AllocateReadbackBuffer(ID3D12Device* device, uint64_t sizeBytes, 
-                                        const std::wstring& name)
-{
-    const auto heapType = D3D12_HEAP_TYPE_READBACK;
-    const auto initialState = D3D12_RESOURCE_STATE_COPY_DEST;
-    const bool isUA = false;
-    return CreateBuffer(device, sizeBytes, heapType, initialState, isUA, name);
-}
-
-void MemCpyGPUBuffer(ID3D12Resource* dst, const void* src, size_t sizeBytes)
-{
-    assert(dst);
-    assert(src);
-    assert(sizeBytes);
-
-    BYTE* dstByteBuffer = nullptr;
-    Utils::AssertIfFailed(dst->Map(0, NULL, reinterpret_cast<void**>(&dstByteBuffer)));
-    assert(dstByteBuffer);
-
-    memcpy(dstByteBuffer, src, sizeBytes);
-
-    dst->Unmap(0, NULL);
-}
-
 D3D12_RESOURCE_BARRIER CreateTransition(ID3D12Resource* resource, 
                                         D3D12_RESOURCE_STATES before, 
                                         D3D12_RESOURCE_STATES after)
@@ -378,7 +230,7 @@ D3D12_RESOURCE_BARRIER CreateTransition(ID3D12Resource* resource,
 
 // TODO not quite happy with returning the temp here. Good enough for now.
 // Note returning the tmp so the object outlives the execution in the gpu
-BufferAllocation EnqueueUploadDataToBuffer(ID3D12Device* device,
+GpuMemAllocation EnqueueUploadDataToBuffer(ID3D12Device* device,
                                            ID3D12GraphicsCommandList* copyCmdList,
                                            ID3D12Resource* dst, const void* data, uint64_t sizeBytes)
 {
@@ -390,8 +242,8 @@ BufferAllocation EnqueueUploadDataToBuffer(ID3D12Device* device,
     assert(copyCmdList->GetType() == D3D12_COMMAND_LIST_TYPE_COPY);
 
     // Create temporal buffer in the upload heap
-    BufferAllocation src = AllocateUploadBuffer(device, sizeBytes, L"Upload temp buffer");
-    MemCpyGPUBuffer(src.m_resource.Get(), data, sizeBytes);
+    GpuMemAllocation src = AllocateUpload(device, sizeBytes, L"Upload temp buffer");
+    MemCpy(src, data, sizeBytes);
 
     // Copy from upload heap to final buffer
     copyCmdList->CopyResource(dst, src.m_resource.Get());
@@ -450,178 +302,7 @@ void ExecuteCmdList(ID3D12Device* device, ID3D12CommandQueue* cmdQueue,
     cmdQueueSyncer.Wait(workId);
 }
 
-// TODO move these to a class
-DescriptorHeap CreateDescriptorHeap(ID3D12Device* device, uint32_t descriptorsCount)
-{
-    assert(device);
-    assert(descriptorsCount > 0);
-
-    DescriptorHeap descriptorHeap;
-
-    D3D12_DESCRIPTOR_HEAP_DESC heapDesc;
-    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heapDesc.NumDescriptors = descriptorsCount;
-    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    heapDesc.NodeMask = 0;
-
-    Utils::AssertIfFailed(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&descriptorHeap.m_d3d12DescriptorHeap)));
-
-    descriptorHeap.m_currentGpuHandle = descriptorHeap.m_d3d12DescriptorHeap->GetGPUDescriptorHandleForHeapStart();
-    descriptorHeap.m_currentCpuHandle = descriptorHeap.m_d3d12DescriptorHeap->GetCPUDescriptorHandleForHeapStart();
-    
-    uint32_t incrementSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    descriptorHeap.m_descriptorHandleIncrementSize = incrementSize;
-
-    return descriptorHeap;
-}
-
-void AddDescriptor(DescriptorHeap& descriptorHeap)
-{
-    descriptorHeap.m_currentCpuHandle.ptr += descriptorHeap.m_descriptorHandleIncrementSize;
-    descriptorHeap.m_currentGpuHandle.ptr += descriptorHeap.m_descriptorHandleIncrementSize;
-}
-
-void CreateBufferDescriptor(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dst, 
-                            ID3D12Resource* resource, DXGI_FORMAT format, 
-                            uint32_t elementsCount)
-{
-    assert(device);
-    assert(resource);
-    assert(format != DXGI_FORMAT_UNKNOWN);
-    assert(elementsCount > 0);
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC desc;
-    desc.Format = format;
-    desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-
-    desc.Buffer.FirstElement = 0;
-    desc.Buffer.NumElements = elementsCount;
-    desc.Buffer.StructureByteStride = 0;
-    desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
-
-    device->CreateShaderResourceView(resource, &desc, dst);
-}
-
-void CreateRWBufferDescriptor(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dst,
-                              ID3D12Resource* resource, DXGI_FORMAT format,
-                              uint32_t elementsCount)
-{
-    assert(device);
-    assert(resource);
-    assert(format != DXGI_FORMAT_UNKNOWN);
-    assert(elementsCount > 0);
-
-    D3D12_UNORDERED_ACCESS_VIEW_DESC desc;
-    desc.Format = format;
-    desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-    desc.Buffer.FirstElement = 0;
-    desc.Buffer.NumElements = elementsCount;
-    desc.Buffer.StructureByteStride = 0;
-    desc.Buffer.CounterOffsetInBytes = 0;
-    desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
-
-    device->CreateUnorderedAccessView(resource, nullptr, &desc, dst);
-}
-
-void CreateStructuredBufferDescriptor(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dst, 
-                                      ID3D12Resource* resource, DXGI_FORMAT format,
-                                      uint32_t elementsCount, uint32_t structureByteStride)
-{
-    assert(device);
-    assert(resource);
-    assert(format != DXGI_FORMAT_UNKNOWN);
-    assert(elementsCount > 0);
-    assert(structureByteStride > 0);
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC desc;
-    desc.Format = format;
-    desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    desc.Buffer.FirstElement = 0;
-    desc.Buffer.NumElements = elementsCount;
-    desc.Buffer.StructureByteStride = structureByteStride;
-    desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
-
-    device->CreateShaderResourceView(resource, &desc, dst);
-}
-
-void CreateRWStructuredBufferDescriptor(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dst,
-                                        ID3D12Resource* resource, DXGI_FORMAT format,
-                                        uint32_t elementsCount, uint32_t structureByteStride)
-{
-    assert(device);
-    assert(resource);
-    assert(format != DXGI_FORMAT_UNKNOWN);
-    assert(elementsCount > 0);
-    assert(structureByteStride > 0);
-
-    D3D12_UNORDERED_ACCESS_VIEW_DESC desc;
-    desc.Format = format;
-    desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-    desc.Buffer.FirstElement = 0;
-    desc.Buffer.NumElements = elementsCount;
-    desc.Buffer.StructureByteStride = structureByteStride;
-    desc.Buffer.CounterOffsetInBytes = 0;
-    desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
-
-    device->CreateUnorderedAccessView(resource, nullptr, &desc, dst);
-}
-
-void CreateByteBufferDescriptor(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dst,
-                                ID3D12Resource* resource, DXGI_FORMAT format,
-                                uint32_t elementsCount)
-{
-    assert(device);
-    assert(resource);
-    assert(format != DXGI_FORMAT_UNKNOWN);
-    assert(elementsCount > 0);
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC desc;
-    desc.Format = format;
-    desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    desc.Buffer.FirstElement = 0;
-    desc.Buffer.NumElements = elementsCount;
-    desc.Buffer.StructureByteStride = 0;
-    desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-
-    device->CreateShaderResourceView(resource, &desc, dst);
-}
-
-void CreateRWByteBufferDescriptor(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dst,
-                                  ID3D12Resource* resource, DXGI_FORMAT format,
-                                  uint32_t elementsCount)
-{
-    assert(device);
-    assert(resource);
-    assert(format != DXGI_FORMAT_UNKNOWN);
-    assert(elementsCount > 0);
-
-    D3D12_UNORDERED_ACCESS_VIEW_DESC desc;
-    desc.Format = format;
-    desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-    desc.Buffer.FirstElement = 0;
-    desc.Buffer.NumElements = elementsCount;
-    desc.Buffer.StructureByteStride = 0;
-    desc.Buffer.CounterOffsetInBytes = 0;
-    desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-
-    device->CreateUnorderedAccessView(resource, nullptr, &desc, dst);
-}
-
-void CreateConstantBufferDescriptor(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dst,
-                                    D3D12_GPU_VIRTUAL_ADDRESS bufferLocation, uint32_t sizeBytes)
-{
-    assert(device);
-
-    D3D12_CONSTANT_BUFFER_VIEW_DESC desc;
-    desc.BufferLocation = bufferLocation;
-    desc.SizeInBytes = sizeBytes;
-
-    device->CreateConstantBufferView(&desc, dst);
-}
-
+// TODO move pipelinestate stuff to other file
 ID3DBlobComPtr CompileBlob(const char* src, const char* target, const char* mainName, unsigned int flags,
                            ID3DBlob* errors)
 {
@@ -755,45 +436,27 @@ void EnqueueResolveTimestampQueries(ID3D12GraphicsCommandList* cmdList, ID3D12Qu
     cmdList->ResolveQueryData(queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, 0, timeStampsCount, readbackBuffer, 0);
 }
 
-template<class T, class F>
-std::vector<T> ReadbackBuffer(ID3D12Resource* readbackBuffer, uint64_t sizeBytes, F&& ProcessData)
-{
-    assert(readbackBuffer);
-    D3D12_RANGE readRange = {};
-    readRange.Begin = 0;
-    readRange.End = sizeBytes;
-
-    void* data = nullptr;
-    Utils::AssertIfFailed(readbackBuffer->Map(0, &readRange, &data));
-
-    std::vector<T> buffer = ProcessData(data);
-
-    D3D12_RANGE emptyRange = {};
-    readbackBuffer->Unmap(0, &emptyRange);
-
-    return buffer;
-}
-
-std::vector<double> ReadbackTimestamps(ID3D12Resource* readbackBuffer, uint32_t timestampsCount, 
+std::vector<double> ReadbackTimestamps(const GpuMemAllocation& allocation, uint32_t timestampsCount, 
                                        uint64_t cmdQueueTimestampFrequency)
 {
-    assert(readbackBuffer);
     assert(timestampsCount > 0);
 
-    auto buffer = ReadbackBuffer<double>(readbackBuffer, timestampsCount * sizeof(uint64_t), 
-                                         [&](void* data)
+    ScopedMappedGpuMemAlloc memMap(allocation);
+
+    std::vector<double> timestamps(timestampsCount);
+    // Note timestamps data are ticks and cmd queue timestamp frequency is ticks/sec
+    const uint64_t* timestampsTicks = reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(memMap.GetBuffer()));
+    for (uint32_t i = 0; i < timestampsCount; ++i)
     {
-        std::vector<double> timestamps(timestampsCount);
-        // Note timestamps data are ticks and cmd queue timestamp frequency is ticks/sec
-        const uint64_t* timestampsTicks = reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(data));
-        for (uint32_t i = 0; i < timestampsCount; ++i)
-        {
-            timestamps[i] = timestampsTicks[i] / static_cast<double>(cmdQueueTimestampFrequency);
-        }
-        return timestamps;
-    });
-    return buffer;
+        timestamps[i] = timestampsTicks[i] / static_cast<double>(cmdQueueTimestampFrequency);
+    }
+
+    return timestamps;
 }
+
+}
+
+using namespace ComputeBasics;
 
 int main(int argc, char** argv)
 {
@@ -814,19 +477,19 @@ int main(int argc, char** argv)
         return -1;
 
     // Allocates buffers
-    auto constantDataBuffer = AllocateReadOnlyBuffer(d3d12Device, sizeof(ConstantData), g_cpyDstState, L"ConstantData");
+    auto constantDataBuffer = Allocate(d3d12Device, sizeof(ConstantData), false, L"ConstantData");
     const size_t threadsPerGroup = 64;
     const size_t threadGroupsCount = 16;
     const size_t dataElementsCount = threadsPerGroup * threadGroupsCount;
     const uint64_t dataSizeBytes = dataElementsCount * sizeof(float);
-    auto inputBuffer = AllocateReadOnlyBuffer(d3d12Device, dataSizeBytes, g_cpyDstState, L"Input");
+    auto inputBuffer = Allocate(d3d12Device, dataSizeBytes, false, L"Input");
     const uint64_t dataPerGroupSizeBytes = threadGroupsCount * sizeof(float);
-    auto inputPerGroupBuffer = AllocateReadOnlyBuffer(d3d12Device, dataPerGroupSizeBytes, g_cpyDstState, L"Input Per Thread Group");
-    auto outputBuffer = AllocateRWBuffer(d3d12Device, dataSizeBytes, g_uaState, L"Output");
-    auto readbackBuffer = AllocateReadbackBuffer(d3d12Device, dataSizeBytes, L"Readback");
+    auto inputPerGroupBuffer = Allocate(d3d12Device, dataPerGroupSizeBytes, false, L"Input Per Thread Group");
+    auto outputBuffer = Allocate(d3d12Device, dataSizeBytes, true, L"Output");
+    auto readbackBuffer = AllocateReadback(d3d12Device, dataSizeBytes, L"Readback");
     const uint64_t timestampsCount = 2;
     const uint64_t timestampBufferSize = timestampsCount * sizeof(uint64_t);
-    auto timeStampBuffer = AllocateReadbackBuffer(d3d12Device, timestampBufferSize, L"TimeStamp");
+    auto timeStampBuffer = AllocateReadback(d3d12Device, timestampBufferSize, L"TimeStamp");
 
     // Upload data to gpu memory
     auto computeCmdQueue = CreateComputeCmdQueue(d3d12Device);
@@ -871,18 +534,9 @@ int main(int argc, char** argv)
 
     // Creates descriptors
     const uint32_t descriptorsCount = 2;
-    DescriptorHeap descriptorHeap = CreateDescriptorHeap(d3d12Device, descriptorsCount);
-    auto descriptorTable = descriptorHeap.m_currentGpuHandle;
-    {
-        const DXGI_FORMAT inputBufferFormat = DXGI_FORMAT_R32_FLOAT;
-        CreateBufferDescriptor(d3d12Device, descriptorHeap.m_currentCpuHandle, inputBuffer.m_resource.Get(),
-                               inputBufferFormat, dataElementsCount);
-        AddDescriptor(descriptorHeap);
-        const DXGI_FORMAT outputBufferFormat = DXGI_FORMAT_R32_FLOAT;
-        CreateRWBufferDescriptor(d3d12Device, descriptorHeap.m_currentCpuHandle, outputBuffer.m_resource.Get(),
-                                 outputBufferFormat, dataElementsCount);
-        AddDescriptor(descriptorHeap);
-    }
+    ComputeBasics::DescriptorHeap descriptorHeap(d3d12Device, descriptorsCount);
+    descriptorHeap.CreateBufferDescriptor(inputBuffer, DXGI_FORMAT_R32_FLOAT, dataElementsCount, false);
+    descriptorHeap.CreateBufferDescriptor(outputBuffer, DXGI_FORMAT_R32_FLOAT, dataElementsCount, true);
 
     // Start clock
     auto& d3d12Cmdlist = computeCmdList.m_cmdList;
@@ -890,10 +544,10 @@ int main(int argc, char** argv)
     EnqueueTimestampQuery(d3d12Cmdlist.Get(), timestampQueryHeap.Get(), 0);
 
     // Setup state
-    ID3D12DescriptorHeap* d3d12DescriptorHeaps[] = { descriptorHeap.m_d3d12DescriptorHeap.Get() };
+    ID3D12DescriptorHeap* d3d12DescriptorHeaps[] = { descriptorHeap.GetD3D12DescriptorHeap() };
     d3d12Cmdlist->SetDescriptorHeaps(1, d3d12DescriptorHeaps);
     d3d12Cmdlist->SetComputeRootSignature(pipelineState.m_rootSignature.Get());
-    d3d12Cmdlist->SetComputeRootDescriptorTable(0, descriptorTable);
+    d3d12Cmdlist->SetComputeRootDescriptorTable(0, descriptorHeap.BeginGpuHandle());
     d3d12Cmdlist->SetComputeRootConstantBufferView(1, constantDataBuffer.m_resource->GetGPUVirtualAddress());
     d3d12Cmdlist->SetComputeRootShaderResourceView(2, inputPerGroupBuffer.m_resource->GetGPUVirtualAddress());
     d3d12Cmdlist->SetPipelineState(pipelineState.m_pso.Get());
@@ -920,25 +574,22 @@ int main(int argc, char** argv)
                           readbackBuffer.m_resource.Get(), outputBuffer.m_resource.Get());
         ExecuteCmdList(d3d12Device, copyCmdQueue.m_cmdQueue.Get(), copyCmdList.m_cmdList.Get());
 
-        // Read from readback buffer
-        std::vector<float> cpuOutputBuffer = ReadbackBuffer<float>(readbackBuffer.m_resource.Get(), dataSizeBytes, 
-                                                                   [&](void* data)
+        std::vector<float> readbackData(dataElementsCount);
         {
-            std::vector<float> outputBuffer(dataElementsCount);
-            memcpy(&outputBuffer[0], data, dataSizeBytes);
-            return outputBuffer;
-        });
+            ScopedMappedGpuMemAlloc scopedMappedAlloc(readbackBuffer);
+            memcpy(&readbackData[0], scopedMappedAlloc.GetBuffer(), dataSizeBytes);
+        }
 
         std::wcout << g_outputTag << "[Output Buffer] ";
-        for (size_t i = 0; i < cpuOutputBuffer.size(); ++i)
+        for (size_t i = 0; i < readbackData.size(); ++i)
         {
-            std::wcout << " " << i << ":"<< cpuOutputBuffer[i] << " ";
+            std::wcout << " " << i << ":"<< readbackData[i] << " ";
         }
         std::cout << "\n";
     }
     
     // Read timestamp buffer
-    auto timestamps = ReadbackTimestamps(timeStampBuffer.m_resource.Get(), timestampsCount, computeCmdQueue.m_timestampFrequency);
+    auto timestamps = ReadbackTimestamps(timeStampBuffer, timestampsCount, computeCmdQueue.m_timestampFrequency);
     const double deltaMicroSecs = (timestamps[1] - timestamps[0]) * 1000000.0;
     std::wcout << g_outputTag << "[Performance] GPU execution time " << deltaMicroSecs << "us\n";
 
